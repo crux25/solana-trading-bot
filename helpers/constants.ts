@@ -49,6 +49,8 @@ export const STOP_LOSS = Number(retrieveEnvVariable('STOP_LOSS', logger));
 export const PRICE_CHECK_INTERVAL = Number(retrieveEnvVariable('PRICE_CHECK_INTERVAL', logger));
 export const PRICE_CHECK_DURATION = Number(retrieveEnvVariable('PRICE_CHECK_DURATION', logger));
 export const SELL_SLIPPAGE = Number(retrieveEnvVariable('SELL_SLIPPAGE', logger));
+export const PARTIAL_PROFIT_THRESHHOLD = Number(retrieveEnvVariable('PARTIAL_PROFIT_THRESHHOLD', logger));
+export const PARTIAL_PROFIT_SELL_PERCENT = Number(retrieveEnvVariable('PARTIAL_PROFIT_SELL_PERCENT', logger));
 
 // Filters
 export const FILTER_CHECK_INTERVAL = Number(retrieveEnvVariable('FILTER_CHECK_INTERVAL', logger));

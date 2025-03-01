@@ -45,6 +45,8 @@ import {
   FILTER_CHECK_INTERVAL,
   FILTER_CHECK_DURATION,
   CONSECUTIVE_FILTER_MATCHES,
+  PARTIAL_PROFIT_THRESHHOLD,
+  PARTIAL_PROFIT_SELL_PERCENT,
 } from './helpers';
 import { version } from './package.json';
 import { WarpTransactionExecutor } from './transactions/warp-transaction-executor';
@@ -190,6 +192,8 @@ const runListener = async () => {
     filterCheckInterval: FILTER_CHECK_INTERVAL,
     filterCheckDuration: FILTER_CHECK_DURATION,
     consecutiveMatchCount: CONSECUTIVE_FILTER_MATCHES,
+    partialProfitThreshold: PARTIAL_PROFIT_THRESHHOLD,
+    partialProfitSellPercent: PARTIAL_PROFIT_SELL_PERCENT,
   };
 
   const bot = new Bot(connection, marketCache, poolCache, txExecutor, botConfig);
