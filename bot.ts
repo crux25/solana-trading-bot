@@ -148,7 +148,7 @@ export class Bot {
             this.config.quoteToken,
             tokenOut,
             this.config.quoteAmount,
-            dynamicBuySlippage,
+            this.config.sellSlippage,
             this.config.wallet,
             'buy',
           );
