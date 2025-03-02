@@ -14,7 +14,7 @@ import {
   RawAccount,
   TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
-import { Liquidity, LiquidityPoolKeysV4, LIQUIDITY_STATE_LAYOUT_V4, LiquidityStateV4, Percent, Token, TokenAmount } from '@raydium-io/raydium-sdk';
+import { Liquidity, LiquidityPoolKeysV4, LIQUIDITY_STATE_LAYOUT_V4, LiquidityStateV4, Percent, Token, TokenAmount, BigNumberish } from '@raydium-io/raydium-sdk';
 import { MarketCache, PoolCache, SnipeListCache } from './cache';
 import { PoolFilters } from './filters';
 import { TransactionExecutor } from './transactions';
@@ -128,6 +128,10 @@ export class Bot {
           return;
         }
       }
+
+      if (!this.isTokenSupplyDistributed(poolState.baseMint, this.connection)) {
+        logger.trace({ mint: poolKeys.baseMint.toString() }, `Skipping buy because token supply is not distributed`);
+      }
       // Adaptive slippage: compute dynamic buy slippage based on market volatility
       const volatility = await this.getMarketVolatility(poolState.baseMint);
       const dynamicBuySlippage = this.calculateAdaptiveSlippage(volatility);
@@ -159,6 +163,8 @@ export class Bot {
               this.config.partialProfitThreshold,
               this.config.partialProfitSellPercent
             );
+            this.monitorTokenPostTrade(poolKeys, this.connection, this.forceSell)
+
             break;
           }
           logger.info({ mint: poolState.baseMint.toString(), signature: result.signature, error: result.error }, `Error confirming buy tx`);
@@ -580,4 +586,60 @@ export class Bot {
     }
   }
 
+  private async isTokenSupplyDistributed(tokenMint: PublicKey, connection: Connection): Promise<boolean> {
+    const largestAccounts = await connection.getTokenLargestAccounts(tokenMint);
+    const totalSupply = (await connection.getTokenSupply(tokenMint)).value.uiAmount || 0;
+
+    if (!totalSupply) return false;
+
+    let topHoldersBalance = 0;
+    for (let i = 0; i < Math.min(5, largestAccounts.value.length); i++) {
+      topHoldersBalance += largestAccounts.value[i].uiAmount || 0;
+    }
+
+    const percentageHeld = (topHoldersBalance / totalSupply) * 100;
+    return percentageHeld <= 50; // Return false if top 5 hold >50%
+  }
+
+  private async monitorTokenPostTrade(
+    poolKeys: LiquidityPoolKeysV4,
+    connection: Connection,
+    forceSell: (poolKeys: LiquidityPoolKeysV4, tokenAmount: TokenAmount) => Promise<void>
+  ) {
+    setInterval(async () => {
+      const isSafe = await this.isTokenSupplyDistributed(poolKeys.baseMint, connection);
+
+      if (!isSafe) {
+        console.warn(`🚨 Detected concentrated token ownership! Selling ${poolKeys.baseMint.toString()}...`);
+
+        // Fetch bot's current token balance
+        const tokenBalance = await this.getTokenBalance(poolKeys.baseMint, connection);
+
+        if (tokenBalance) {
+          const token = new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals);
+          const tokenAmount = new TokenAmount(token, tokenBalance); // Fix: Correctly create TokenAmount
+          await forceSell(poolKeys, tokenAmount);
+        } else {
+          console.warn(`⚠️ No token balance found for ${poolKeys.baseMint.toString()}.`);
+        }
+      }
+    }, 3000); // Check every 10 seconds
+  }
+
+  private async getTokenBalance(tokenMint: PublicKey, connection: Connection): Promise<BigNumberish | null> {
+    try {
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+        this.config.wallet.publicKey,
+        { mint: tokenMint }
+      );
+
+      if (tokenAccounts.value.length > 0) {
+        const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount;
+        return BigInt(balance); // Ensure it’s a valid BigNumberish type
+      }
+    } catch (error) {
+      console.error(`❌ Error fetching token balance:`, error);
+    }
+    return null;
+  }
 }
