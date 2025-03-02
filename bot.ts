@@ -129,8 +129,10 @@ export class Bot {
         }
       }
 
-      if (!this.isTokenSupplyDistributed(poolState.baseMint, this.connection)) {
+      const isTokenSupplyDistributed = await this.isTokenSupplyDistributed(poolState.baseMint, this.connection)
+      if (!isTokenSupplyDistributed) {
         logger.trace({ mint: poolKeys.baseMint.toString() }, `Skipping buy because token supply is not distributed`);
+        return
       }
       // Adaptive slippage: compute dynamic buy slippage based on market volatility
       const volatility = await this.getMarketVolatility(poolState.baseMint);
