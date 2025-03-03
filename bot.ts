@@ -468,22 +468,28 @@ export class Bot {
           slippage: new Percent(this.config.sellSlippage, 100),
         });
         const currentPrice = computed.amountOut as TokenAmount;
+
         if (!maxPrice || currentPrice.gt(maxPrice)) {
           maxPrice = currentPrice;
         }
-        // Calculate threshold price: maxPrice * (1 - trailingPercent)
-        const thresholdRaw = maxPrice.raw
-          .mul(new BN(100 - trailingPercent * 100))
-          .div(new BN(100));
+
+        // Calculate trailing threshold: maxPrice * (1 - trailingPercent/100)
+        const thresholdRaw = maxPrice.raw.mul(new BN(100 - trailingPercent * 100)).div(new BN(100));
         const thresholdPrice = new TokenAmount(this.config.quoteToken, thresholdRaw, true);
+
+        // Log current metrics for debugging
+        logger.debug({ mint: poolKeys.baseMint.toString() },
+          `Max Price: ${maxPrice.toFixed()} | Current Price: ${currentPrice.toFixed()} | Threshold: ${thresholdPrice.toFixed()}`
+        );
+
         if (currentPrice.lt(thresholdPrice)) {
-          logger.warn(
-            { mint: poolKeys.baseMint.toString() },
-            `Trailing stop-loss triggered: current price ${currentPrice.toFixed()} is below threshold ${thresholdPrice.toFixed()}. Initiating emergency sell.`
+          logger.warn({ mint: poolKeys.baseMint.toString() },
+            `Trailing stop-loss triggered: current price ${currentPrice.toFixed()} below threshold ${thresholdPrice.toFixed()}. Initiating emergency sell.`
           );
           await this.forceSell(poolKeys, tokenAmount);
           break;
         }
+
         await sleep(this.config.priceCheckInterval);
       } catch (error) {
         logger.error({ mint: poolKeys.baseMint.toString(), error }, 'Error in trailing stop-loss monitor.');
@@ -491,6 +497,7 @@ export class Bot {
       }
     }
   }
+
 
   private async forceSell(poolKeys: LiquidityPoolKeysV4, tokenAmount: TokenAmount): Promise<void> {
     try {
