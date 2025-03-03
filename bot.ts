@@ -607,26 +607,27 @@ export class Bot {
     poolKeys: LiquidityPoolKeysV4,
     connection: Connection,
     forceSell: (poolKeys: LiquidityPoolKeysV4, tokenAmount: TokenAmount) => Promise<void>
-  ) {
-    setInterval(async () => {
-      const isSafe = await this.isTokenSupplyDistributed(poolKeys.baseMint, connection);
-
-      if (!isSafe) {
-        console.warn(`🚨 Detected concentrated token ownership! Selling ${poolKeys.baseMint.toString()}...`);
-
-        // Fetch bot's current token balance
-        const tokenBalance = await this.getTokenBalance(poolKeys.baseMint, connection);
-
-        if (tokenBalance) {
-          const token = new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals);
-          const tokenAmount = new TokenAmount(token, tokenBalance); // Fix: Correctly create TokenAmount
-          await forceSell(poolKeys, tokenAmount);
-        } else {
-          console.warn(`⚠️ No token balance found for ${poolKeys.baseMint.toString()}.`);
-        }
+  ): Promise<void> {
+    const intervalId = setInterval(async () => {
+      // Check current token balance (you should implement getTokenBalance to return a numeric balance)
+      const tokenBalance = await this.getTokenBalance(poolKeys.baseMint, connection);
+      if (tokenBalance === null || new BN(tokenBalance.toString()).lte(new BN(0))) {
+        console.log(`Token ${poolKeys.baseMint.toBase58()} balance is zero. Stopping monitoring.`);
+        clearInterval(intervalId);
+        return;
       }
-    }, 3000); // Check every 10 seconds
+
+      // Check for concentrated token ownership
+      const isSafe = await this.isTokenSupplyDistributed(poolKeys.baseMint, connection);
+      if (!isSafe) {
+        console.warn(`Detected concentrated token ownership for ${poolKeys.baseMint.toBase58()}! Initiating force sell.`);
+        const token = new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals);
+        const tokenAmount = new TokenAmount(token, tokenBalance); // Fix: Correctly create TokenAmount
+        await forceSell(poolKeys, tokenAmount);
+      }
+    }, 10000); // Check every 10 seconds
   }
+
 
   private async getTokenBalance(tokenMint: PublicKey, connection: Connection): Promise<BigNumberish | null> {
     try {
