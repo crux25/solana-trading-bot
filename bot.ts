@@ -632,7 +632,7 @@ export class Bot {
         const tokenAmount = new TokenAmount(token, tokenBalance); // Fix: Correctly create TokenAmount
         await forceSell(poolKeys, tokenAmount);
       }
-    }, 10000); // Check every 10 seconds
+    }, 500); // Check every 10 seconds
   }
 
 
