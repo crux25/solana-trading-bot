@@ -161,12 +161,6 @@ export class Bot {
         }
       }
 
-      const rugPullRisk = await this.detectRugPullRisk(poolKeys);
-      if (!rugPullRisk.safe) {
-        logger.warn({ mint: poolState.baseMint, reason: rugPullRisk.reason }, `Skipping buy due to rug pull risk`);
-        return;
-      }
-
       for (let i = 0; i < this.config.maxBuyRetries; i++) {
         try {
           logger.info({ mint: poolState.baseMint.toString() }, `Send buy transaction attempt: ${i + 1}/${this.config.maxBuyRetries}`);
@@ -197,7 +191,7 @@ export class Bot {
             );
 
             // Start quick monitoring
-            await this.quickRugCheck(poolKeys, purchasedTokenAmount);
+            this.quickRugCheck(poolKeys, purchasedTokenAmount);
 
             break;
           }
