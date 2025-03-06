@@ -756,17 +756,20 @@ export class Bot {
       if (!largestLPHolders?.value?.length) {
         return { safe: false, reason: 'No LP holders found' };
       }
-      console.log(`largestLPHolders: ${JSON.stringify(largestLPHolders)}`);
 
-      // Calculate total concentration of top 10 holders
+      // Get token account address for the pool
+      const tokenAccountAddress = poolKeys.baseVault.toString();
+
+      // Calculate total concentration of top 10 holders, excluding the token account
       const totalTopHoldersAmount = largestLPHolders.value
+        .filter(holder => holder.address.toString() !== tokenAccountAddress) // Exclude token account
         .slice(0, 10) // Take top 10 holders
         .reduce((sum, holder) => sum + BigInt(holder.amount), BigInt(0));
 
       const concentration = (Number(totalTopHoldersAmount) / Number(lpTokenSupply)) * 100;
       
       logger.debug(
-        `Top 10 holders concentration: ${concentration.toFixed(2)}% ` +
+        `Top 10 holders concentration (excluding token account): ${concentration.toFixed(2)}% ` +
         `(${totalTopHoldersAmount} / ${lpTokenSupply})`
       );
 
