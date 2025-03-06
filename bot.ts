@@ -756,7 +756,7 @@ export class Bot {
       if (!largestLPHolders?.value?.length) {
         return { safe: false, reason: 'No LP holders found' };
       }
-      console.log(`largestLPHolders: ${largestLPHolders}`);
+      console.log(`largestLPHolders: ${JSON.stringify(largestLPHolders)}`);
 
       // Calculate total concentration of top 10 holders
       const totalTopHoldersAmount = largestLPHolders.value
