@@ -769,7 +769,7 @@ export class Bot {
         `(${totalTopHoldersAmount} / ${lpTokenSupply})`
       );
 
-      if (isNaN(concentration) || concentration > 20) {
+      if (isNaN(concentration) || concentration > 50) {
         return { 
           safe: false, 
           reason: `High LP concentration: top 10 holders control ${concentration.toFixed(2)}%`
