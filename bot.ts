@@ -5,6 +5,8 @@ import {
   PublicKey,
   TransactionMessage,
   VersionedTransaction,
+  SystemProgram,
+  TransactionInstruction,
 } from '@solana/web3.js';
 import {
   createAssociatedTokenAccountIdempotentInstruction,
@@ -57,13 +59,43 @@ export interface BotConfig {
   partialProfitSellPercent: number
 }
 
+interface TransactionMetrics {
+  timestamp: string;
+  type: 'buy' | 'sell';
+  mint: string;
+  gasUsed: number;
+  fee: number;
+  success: boolean;
+  blockTime?: number;
+  slot?: number;
+}
+
+interface QuickRugCheck {
+  lpConcentration: number;
+  liquidityUSD: number;
+  lastUpdate: number;
+}
+
 export class Bot {
   private readonly poolFilters: PoolFilters;
   private readonly snipeListCache?: SnipeListCache;
   private readonly mutex: Mutex;
+  private readonly cache = new Map<string, { data: any; timestamp: number }>();
   private sellExecutionCount = 0;
   public readonly isWarp: boolean = false;
   public readonly isJito: boolean = false;
+  private readonly QUICK_CHECK_INTERVAL = 3000; // 3 seconds
+  private readonly CRITICAL_THRESHOLDS = {
+    LP_REMOVAL_PERCENT: 20,     // 20% sudden LP removal
+    MIN_LIQUIDITY_USD: 5000,    // $5000 minimum liquidity
+    MAX_LP_CONCENTRATION: 90,   // 90% max LP concentration
+  };
+  private activeMonitors = new Map<string, {
+    interval: NodeJS.Timer;
+    lastCheck: QuickRugCheck;
+  }>();
+  private readonly MIN_VALID_PRICE = 0.000000001; // $0.000000001
+  private readonly MONITOR_INTERVAL = 3000; // 3 seconds
 
   constructor(
     private readonly connection: Connection,
@@ -129,14 +161,12 @@ export class Bot {
         }
       }
 
-      const isTokenSupplyDistributed = await this.isTokenSupplyDistributed(poolState.baseMint, this.connection)
-      if (!isTokenSupplyDistributed) {
-        logger.trace({ mint: poolKeys.baseMint.toString() }, `Skipping buy because token supply is not distributed`);
-        return
+      const rugPullRisk = await this.detectRugPullRisk(poolKeys);
+      if (!rugPullRisk.safe) {
+        logger.warn({ mint: poolState.baseMint, reason: rugPullRisk.reason }, `Skipping buy due to rug pull risk`);
+        return;
       }
-      // Adaptive slippage: compute dynamic buy slippage based on market volatility
-      const volatility = await this.getMarketVolatility(poolState.baseMint);
-      const dynamicBuySlippage = this.calculateAdaptiveSlippage(volatility);
+
       for (let i = 0; i < this.config.maxBuyRetries; i++) {
         try {
           logger.info({ mint: poolState.baseMint.toString() }, `Send buy transaction attempt: ${i + 1}/${this.config.maxBuyRetries}`);
@@ -165,7 +195,9 @@ export class Bot {
               this.config.partialProfitThreshold,
               this.config.partialProfitSellPercent
             );
-            this.monitorTokenPostTrade(poolKeys, this.connection, this.forceSell)
+
+            // Start quick monitoring
+            await this.quickRugCheck(poolKeys, purchasedTokenAmount);
 
             break;
           }
@@ -184,6 +216,14 @@ export class Bot {
   }
 
   public async sell(accountId: PublicKey, rawAccount: RawAccount) {
+    const mintAddress = rawAccount.mint.toString();
+    
+    // Clear monitor if exists
+    if (this.activeMonitors.has(mintAddress)) {
+      clearInterval(this.activeMonitors.get(mintAddress)!.interval);
+      this.activeMonitors.delete(mintAddress);
+    }
+
     if (this.config.oneTokenAtATime) {
       this.sellExecutionCount++;
     }
@@ -375,6 +415,7 @@ export class Bot {
           { mint: poolKeys.baseMint.toString() },
           `Take profit: ${takeProfit.toFixed()} | Stop loss: ${stopLoss.toFixed()} | Current: ${amountOut.toFixed()}`
         );
+  
 
         if (amountOut.lt(stopLoss)) break;
         if (amountOut.gt(takeProfit)) break;
@@ -490,14 +531,13 @@ export class Bot {
           break;
         }
 
-        await sleep(this.config.priceCheckInterval);
+        await sleep(this.MONITOR_INTERVAL);
       } catch (error) {
         logger.error({ mint: poolKeys.baseMint.toString(), error }, 'Error in trailing stop-loss monitor.');
         break;
       }
     }
   }
-
 
   private async forceSell(poolKeys: LiquidityPoolKeysV4, tokenAmount: TokenAmount): Promise<void> {
     try {
@@ -523,49 +563,56 @@ export class Bot {
     }
   }
 
-  /*
-    partialProfitThreshold: number;
-    partialProfitSellPercent: number;
-  */
-
   // New method for partial profit-taking:
   private async partialProfitTakingMonitor(
-    purchasedTokenAmount: TokenAmount,
+    tokenAmount: TokenAmount,
     poolKeys: LiquidityPoolKeysV4,
-    profitThreshold: number,    // e.g., 20 for 20% profit target
-    sellPercentage: number      // e.g., 30 for selling 30% of position
+    profitThreshold: number,    // e.g., 30 for 30% profit target
+    sellPercentage: number      // e.g., 50 for selling 50% of position
   ): Promise<void> {
-    // Compute the initial price based on the purchased amount.
-    // Here we assume that when you bought, the quote amount (in your config) represents the initial price.
-    // You might replace this with a more precise purchase price.
-    const initialPrice = this.config.quoteAmount;
-    // Compute target price = initialPrice * (1 + profitThreshold/100)
+    // Get initial price
+    const poolInfo = await Liquidity.fetchInfo({ connection: this.connection, poolKeys });
+    const initialComputed = Liquidity.computeAmountOut({
+      poolKeys,
+      poolInfo,
+      amountIn: tokenAmount,
+      currencyOut: this.config.quoteToken,
+      slippage: new Percent(this.config.sellSlippage, 100),
+    });
+    const initialPrice = initialComputed.amountOut as TokenAmount;
+
+    // Calculate target price
     const targetRaw = initialPrice.raw.mul(new BN(100 + profitThreshold)).div(new BN(100));
-    const targetPrice = new TokenAmount(this.config.quoteToken, targetRaw, true);
+    let targetPrice = new TokenAmount(this.config.quoteToken, targetRaw, true);
 
     while (true) {
       try {
-        const poolInfo = await Liquidity.fetchInfo({ connection: this.connection, poolKeys });
+        const currentPoolInfo = await Liquidity.fetchInfo({ connection: this.connection, poolKeys });
         const computed = Liquidity.computeAmountOut({
           poolKeys,
-          poolInfo,
-          amountIn: purchasedTokenAmount,
+          poolInfo: currentPoolInfo,
+          amountIn: tokenAmount,
           currencyOut: this.config.quoteToken,
           slippage: new Percent(this.config.sellSlippage, 100),
         });
         const currentPrice = computed.amountOut as TokenAmount;
+
         logger.debug(
           { mint: poolKeys.baseMint.toString() },
           `Partial profit monitor: Target ${targetPrice.toFixed()}, Current ${currentPrice.toFixed()}`
         );
+
         if (currentPrice.gt(targetPrice)) {
-          // Sell a fraction of your position
-          const partialRaw = purchasedTokenAmount.raw.mul(new BN(sellPercentage)).div(new BN(100));
-          const partialSellAmount = new TokenAmount(purchasedTokenAmount.token, partialRaw, true);
+          // Calculate partial sell amount
+          const partialRaw = tokenAmount.raw.mul(new BN(sellPercentage)).div(new BN(100));
+          const partialSellAmount = new TokenAmount(tokenAmount.token, partialRaw, true);
+
           logger.info(
             { mint: poolKeys.baseMint.toString() },
             `Partial profit target reached. Selling ${sellPercentage}% of position.`
           );
+
+          // Execute partial sell
           const result = await this.swap(
             poolKeys,
             this.config.wallet.publicKey,
@@ -577,62 +624,29 @@ export class Bot {
             this.config.wallet,
             'sell'
           );
+
           if (result.confirmed) {
             logger.info(
               { mint: poolKeys.baseMint.toString(), signature: result.signature },
               'Partial profit sell confirmed.'
             );
-          } else {
-            logger.warn({ mint: poolKeys.baseMint.toString() }, 'Partial profit sell failed.');
+            
+            // Update token amount for remaining position
+            const remainingRaw = tokenAmount.raw.sub(partialRaw);
+            tokenAmount = new TokenAmount(tokenAmount.token, remainingRaw, true);
+
+            // Update target for remaining position
+            const newTargetRaw = currentPrice.raw.mul(new BN(100 + profitThreshold)).div(new BN(100));
+            targetPrice = new TokenAmount(this.config.quoteToken, newTargetRaw, true);
           }
-          break;
         }
-        await sleep(this.config.priceCheckInterval);
+
+        await sleep(this.MONITOR_INTERVAL);
       } catch (error) {
         logger.error({ mint: poolKeys.baseMint.toString(), error }, 'Error in partial profit-taking monitor.');
         break;
       }
     }
-  }
-
-  private async isTokenSupplyDistributed(tokenMint: PublicKey, connection: Connection): Promise<boolean> {
-    const largestAccounts = await connection.getTokenLargestAccounts(tokenMint);
-    const totalSupply = (await connection.getTokenSupply(tokenMint)).value.uiAmount || 0;
-
-    if (!totalSupply) return false;
-
-    let topHoldersBalance = 0;
-    for (let i = 0; i < Math.min(5, largestAccounts.value.length); i++) {
-      topHoldersBalance += largestAccounts.value[i].uiAmount || 0;
-    }
-
-    const percentageHeld = (topHoldersBalance / totalSupply) * 100;
-    return percentageHeld <= 50; // Return false if top 5 hold >50%
-  }
-
-  private async monitorTokenPostTrade(
-    poolKeys: LiquidityPoolKeysV4,
-    connection: Connection,
-    forceSell: (poolKeys: LiquidityPoolKeysV4, tokenAmount: TokenAmount) => Promise<void>
-  ): Promise<void> {
-    const intervalId = setInterval(async () => {
-      // Check current token balance (you should implement getTokenBalance to return a numeric balance)
-      const tokenBalance = await this.getTokenBalance(poolKeys.baseMint, connection);
-      if (tokenBalance === null || new BN(tokenBalance.toString()).lte(new BN(0))) {
-        console.log(`Token ${poolKeys.baseMint.toBase58()} balance is zero. Stopping monitoring.`);
-        clearInterval(intervalId);
-        return;
-      }
-
-      // Check for concentrated token ownership
-      const isSafe = await this.isTokenSupplyDistributed(poolKeys.baseMint, connection);
-      if (!isSafe) {
-        console.warn(`Detected concentrated token ownership for ${poolKeys.baseMint.toBase58()}! Initiating force sell.`);
-        const token = new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals);
-        const tokenAmount = new TokenAmount(token, tokenBalance); // Fix: Correctly create TokenAmount
-        await forceSell(poolKeys, tokenAmount);
-      }
-    }, 500); // Check every 10 seconds
   }
 
 
@@ -645,11 +659,481 @@ export class Bot {
 
       if (tokenAccounts.value.length > 0) {
         const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount;
-        return BigInt(balance); // Ensure it’s a valid BigNumberish type
+        return BigInt(balance); // Ensure it's a valid BigNumberish type
       }
     } catch (error) {
       console.error(`❌ Error fetching token balance:`, error);
     }
     return null;
+  }
+
+  private async getCachedData<T>(
+    key: string,
+    fetchFn: () => Promise<T>,
+    ttlMs: number = 100
+  ): Promise<T> {
+    const cached = this.cache.get(key);
+    const now = Date.now();
+    
+    if (cached && now - cached.timestamp < ttlMs) {
+      return cached.data as T;
+    }
+
+    const fresh = await fetchFn();
+    this.cache.set(key, {
+      data: fresh,
+      timestamp: now
+    });
+    
+    return fresh;
+  }
+
+  private async getPoolInfo(poolKeys: LiquidityPoolKeysV4) {
+    return this.getCachedData(
+      `pool-${poolKeys.id}`,
+      () => Liquidity.fetchInfo({ connection: this.connection, poolKeys }),
+      100
+    );
+  }
+
+  private async detectHoneypot(poolKeys: LiquidityPoolKeysV4): Promise<boolean> {
+    try {
+      // Create test amount as 1% of normal amount using BN arithmetic
+      const ONE_PERCENT = new BN(1);
+      const ONE_HUNDRED = new BN(100);
+      const testAmount = new TokenAmount(
+        this.config.quoteToken,
+        this.config.quoteAmount.raw.mul(ONE_PERCENT).div(ONE_HUNDRED)
+      );
+      const poolInfo = await this.getPoolInfo(poolKeys);
+      
+      const buySimulation = Liquidity.computeAmountOut({
+        poolKeys,
+        poolInfo,
+        amountIn: testAmount,
+        currencyOut: this.config.quoteToken,
+        slippage: new Percent(1, 100),
+      });
+
+      const sellSimulation = Liquidity.computeAmountOut({
+        poolKeys,
+        poolInfo,
+        amountIn: buySimulation.amountOut as TokenAmount,
+        currencyOut: this.config.quoteToken,
+        slippage: new Percent(1, 100),
+      });
+
+      const roundTripLoss = testAmount.subtract((sellSimulation.amountOut as TokenAmount));
+      const lossPercentage = new TokenAmount(
+        this.config.quoteToken, 
+        roundTripLoss.raw.mul(ONE_HUNDRED).div(testAmount.raw),
+        true
+      );
+
+      // Return true if loss percentage is greater than 10%
+      return lossPercentage.raw.toNumber() > 10;
+    } catch (error) {
+      logger.error('Honeypot detection failed:', error);
+      return false;
+    }
+  }
+
+  private async detectRugPullRisk(poolKeys: LiquidityPoolKeysV4): Promise<{
+    safe: boolean;
+    reason?: string;
+  }> {
+    try {
+      const poolInfo = await this.getPoolInfo(poolKeys);
+      
+      // Validate LP token supply
+      const lpTokenSupply = poolInfo.lpSupply;
+      if (!lpTokenSupply || lpTokenSupply.isZero()) {
+        return { safe: false, reason: 'Invalid LP token supply' };
+      }
+
+      // Safely get LP holders
+      const largestLPHolders = await this.connection.getTokenLargestAccounts(poolKeys.lpMint);
+      if (!largestLPHolders?.value?.length) {
+        return { safe: false, reason: 'No LP holders found' };
+      }
+
+      // Calculate concentration with validation
+      const topHolderAmount = largestLPHolders.value[0].amount;
+      if (!topHolderAmount) {
+        return { safe: false, reason: 'Invalid LP holder amount' };
+      }
+
+      const concentration = (Number(topHolderAmount) / Number(lpTokenSupply)) * 100;
+      if (isNaN(concentration) || concentration > 80) {
+        return { safe: false, reason: 'High or invalid LP token concentration' };
+      }
+
+      // Check for recent liquidity changes
+      const recentPoolChanges = await this.connection.getSignaturesForAddress(poolKeys.id);
+      const suddenLiquidityRemoval = recentPoolChanges.some(tx => {
+        if (!tx?.memo || !tx?.blockTime) return false;
+        const timeSinceBlock = Date.now() - (tx.blockTime * 1000);
+        return tx.memo.includes('remove_liquidity') && timeSinceBlock < 300000;
+      });
+
+      if (suddenLiquidityRemoval) {
+        return { safe: false, reason: 'Recent suspicious liquidity removal' };
+      }
+
+      return { safe: true };
+    } catch (error) {
+      logger.error('Rug pull detection failed:', error);
+      return { safe: false, reason: 'Detection error' };
+    }
+  }
+
+  private async protectFromMEV(
+    transaction: VersionedTransaction,
+    wallet: Keypair
+  ): Promise<VersionedTransaction> {
+    try {
+      // Add entropy to transaction without delay
+      const dummyInstruction = SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: wallet.publicKey,
+        lamports: Math.floor(Math.random() * 10) // Small random amount
+      });
+
+      // Decompile existing instructions
+      const instructions = transaction.message.compiledInstructions.map(ix => ({
+        programId: transaction.message.staticAccountKeys[ix.programIdIndex],
+        keys: ix.accountKeyIndexes.map(idx => ({
+          pubkey: transaction.message.staticAccountKeys[idx],
+          isSigner: false,
+          isWritable: false
+        })),
+        data: Buffer.from(ix.data)
+      })) as TransactionInstruction[];
+
+      // Add dummy instruction at the beginning to prevent front-running
+      return new VersionedTransaction(
+        new TransactionMessage({
+          payerKey: wallet.publicKey,
+          recentBlockhash: transaction.message.recentBlockhash,
+          instructions: [dummyInstruction, ...instructions]
+        }).compileToV0Message()
+      );
+    } catch (error) {
+      logger.error('MEV protection failed:', error);
+      return transaction; // Return original transaction if protection fails
+    }
+  }
+
+  private async monitorTransaction(
+    signature: string,
+    context: { type: 'buy' | 'sell'; mint: string }
+  ): Promise<void> {
+    try {
+      const tx = await this.connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed'
+      });
+
+      const metrics: TransactionMetrics = {
+        timestamp: new Date().toISOString(),
+        type: context.type,
+        mint: context.mint,
+        gasUsed: tx?.meta?.computeUnitsConsumed || 0,
+        fee: tx?.meta?.fee || 0,
+        success: !tx?.meta?.err,
+        blockTime: tx?.blockTime ?? undefined,
+        slot: tx?.slot ?? undefined,
+      };
+
+      // Only log metrics if transaction is confirmed
+      if (metrics.success) {
+        logger.info({ 
+          transaction: metrics,
+          url: `https://solscan.io/tx/${signature}?cluster=${this.connection.rpcEndpoint.includes('mainnet') ? 'mainnet' : 'devnet'}`
+        }, 'Transaction metrics');
+
+        // Only check gas usage for confirmed transactions
+        if (metrics.gasUsed > 200000) {
+          logger.warn({ signature, gasUsed: metrics.gasUsed }, 'High gas usage detected in confirmed transaction');
+        }
+      } else {
+        logger.warn({ 
+          signature,
+          error: tx?.meta?.err 
+        }, 'Transaction failed');
+      }
+
+      // Note: Implement metricsStorage if needed
+      // await this.metricsStorage.save(metrics);
+
+    } catch (error) {
+      logger.error('Failed to monitor transaction:', error);
+    }
+  }
+
+  private async quickRugCheck(
+    poolKeys: LiquidityPoolKeysV4,
+    tokenAmount: TokenAmount
+  ): Promise<void> {
+    const mintAddress = poolKeys.baseMint.toString();
+    
+    if (this.activeMonitors.has(mintAddress)) {
+      clearInterval(this.activeMonitors.get(mintAddress)!.interval);
+    }
+
+    const initialCheck = await this.getQuickMetrics(poolKeys);
+    const initialPrice = this.getTokenPrice(await this.getPoolInfo(poolKeys));
+    
+    const monitor = setInterval(async () => {
+      try {
+        const poolInfo = await this.getPoolInfo(poolKeys);
+        const currentCheck = await this.getQuickMetrics(poolKeys);
+        const currentPrice = this.getTokenPrice(poolInfo);
+        const lastCheck = this.activeMonitors.get(mintAddress)?.lastCheck || initialCheck;
+
+        // Calculate price change percentage
+        const priceChangePercent = ((currentPrice - initialPrice) / initialPrice) * 100;
+
+        // Quick checks for critical changes
+        const lpRemovalPercent = ((lastCheck.lpConcentration - currentCheck.lpConcentration) / lastCheck.lpConcentration) * 100;
+        const liquidityDropPercent = ((lastCheck.liquidityUSD - currentCheck.liquidityUSD) / lastCheck.liquidityUSD) * 100;
+
+        // Emergency sell conditions
+        if (
+          lpRemovalPercent >= this.CRITICAL_THRESHOLDS.LP_REMOVAL_PERCENT ||
+          currentCheck.liquidityUSD < this.CRITICAL_THRESHOLDS.MIN_LIQUIDITY_USD ||
+          currentCheck.lpConcentration > this.CRITICAL_THRESHOLDS.MAX_LP_CONCENTRATION ||
+          priceChangePercent <= -30 // Add 30% price drop threshold
+        ) {
+          logger.warn({
+            mint: mintAddress,
+            lpRemoval: lpRemovalPercent,
+            liquidity: currentCheck.liquidityUSD,
+            lpConcentration: currentCheck.lpConcentration,
+            priceChange: priceChangePercent
+          }, 'Critical risk detected - Emergency selling');
+
+          await this.forceSell(poolKeys, tokenAmount);
+          
+          clearInterval(monitor);
+          this.activeMonitors.delete(mintAddress);
+          return;
+        }
+
+        this.activeMonitors.set(mintAddress, {
+          interval: monitor,
+          lastCheck: currentCheck
+        });
+
+      } catch (error) {
+        logger.error({ mint: mintAddress, error }, 'Error in quick rug check');
+      }
+    }, this.QUICK_CHECK_INTERVAL);
+
+    this.activeMonitors.set(mintAddress, {
+      interval: monitor,
+      lastCheck: initialCheck
+    });
+  }
+
+  private async getQuickMetrics(poolKeys: LiquidityPoolKeysV4): Promise<QuickRugCheck> {
+    try {
+      const poolInfo = await this.getPoolInfo(poolKeys);
+      
+      // Validate pool info and LP supply
+      if (!poolInfo?.lpSupply || poolInfo.lpSupply.isZero()) {
+        logger.warn({ mint: poolKeys.baseMint.toString() }, 'Invalid or zero LP supply');
+        return {
+          lpConcentration: 100, // Assume worst case for safety
+          liquidityUSD: 0,
+          lastUpdate: Date.now()
+        };
+      }
+
+      // Get and validate LP holders
+      const lpHolders = await this.connection.getTokenLargestAccounts(poolKeys.lpMint);
+      if (!lpHolders?.value?.length) {
+        logger.warn({ mint: poolKeys.baseMint.toString() }, 'No LP holders found');
+        return {
+          lpConcentration: 100, // Assume worst case for safety
+          liquidityUSD: 0,
+          lastUpdate: Date.now()
+        };
+      }
+
+      // Calculate concentration with validation
+      const largestHolderAmount = lpHolders.value[0].amount;
+      if (!largestHolderAmount) {
+        logger.warn({ mint: poolKeys.baseMint.toString() }, 'Invalid LP holder amount');
+        return {
+          lpConcentration: 100, // Assume worst case for safety
+          liquidityUSD: 0,
+          lastUpdate: Date.now()
+        };
+      }
+
+      const lpConcentration = (Number(largestHolderAmount) / Number(poolInfo.lpSupply)) * 100;
+      
+      // Validate concentration calculation
+      if (isNaN(lpConcentration) || !isFinite(lpConcentration)) {
+        logger.warn({ mint: poolKeys.baseMint.toString() }, 'Invalid LP concentration calculation');
+        return {
+          lpConcentration: 100, // Assume worst case for safety
+          liquidityUSD: 0,
+          lastUpdate: Date.now()
+        };
+      }
+
+      // Quick liquidity check in USD
+      const liquidityUSD = this.calculatePoolLiquidityUSD(poolInfo);
+
+      return {
+        lpConcentration,
+        liquidityUSD,
+        lastUpdate: Date.now()
+      };
+
+    } catch (error) {
+      logger.error({ 
+        mint: poolKeys.baseMint.toString(),
+        error 
+      }, 'Error calculating quick metrics');
+      
+      // Return conservative values on error
+      return {
+        lpConcentration: 100, // Assume worst case for safety
+        liquidityUSD: 0,
+        lastUpdate: Date.now()
+      };
+    }
+  }
+
+  private calculatePoolLiquidityUSD(poolInfo: any): number {
+    try {
+      // Input validation
+      if (!poolInfo?.baseReserve || !poolInfo?.quoteReserve) {
+        logger.warn('Missing pool reserves');
+        return 0;
+      }
+
+      // Convert to BN and validate
+      const baseReserve = new BN(poolInfo.baseReserve);
+      const quoteReserve = new BN(poolInfo.quoteReserve);
+      
+      if (baseReserve.isZero() || quoteReserve.isZero()) {
+        logger.debug('Zero reserves detected');
+        return 0;
+      }
+
+      // Get decimals with validation
+      const baseDecimal = Number(poolInfo.baseDecimals) || 9;
+      const quoteDecimal = Number(poolInfo.quoteDecimals) || 6;
+      
+      if (isNaN(baseDecimal) || isNaN(quoteDecimal)) {
+        logger.warn('Invalid decimal values');
+        return 0;
+      }
+
+      // Calculate amounts using BN arithmetic to maintain precision
+      const baseAmountBN = baseReserve.div(new BN(10).pow(new BN(baseDecimal)));
+      const quoteAmountBN = quoteReserve.div(new BN(10).pow(new BN(quoteDecimal)));
+
+      if (baseAmountBN.isZero() || quoteAmountBN.isZero()) {
+        logger.debug('Zero amounts after decimal adjustment');
+        return 0;
+      }
+
+      // Calculate price using BN division
+      const priceBN = quoteAmountBN.mul(new BN(10).pow(new BN(9))).div(baseAmountBN);
+      const price = priceBN.toNumber() / 1e9;
+
+      if (isNaN(price) || price <= 0) {
+        logger.warn('Invalid price calculation');
+        return 0;
+      }
+
+      // Calculate total liquidity in USD
+      // sqrt(baseAmount * quoteAmount * 4) gives us the geometric mean of both sides
+      const baseInQuote = baseAmountBN.mul(priceBN).div(new BN(10).pow(new BN(9)));
+      const totalLiquidityBN = baseInQuote.add(quoteAmountBN);
+      const totalLiquidityUSD = totalLiquidityBN.toNumber() / 1e6; // Convert to USD assuming 6 decimals
+
+      // Final validation
+      if (isNaN(totalLiquidityUSD) || totalLiquidityUSD < 0) {
+        logger.warn('Invalid liquidity calculation');
+        return 0;
+      }
+
+      logger.debug({
+        baseReserve: baseReserve.toString(),
+        quoteReserve: quoteReserve.toString(),
+        price,
+        liquidityUSD: totalLiquidityUSD
+      }, 'Pool liquidity calculation');
+
+      return totalLiquidityUSD;
+
+    } catch (error) {
+      logger.error({
+        error,
+        poolInfo
+      }, 'Error calculating pool liquidity');
+      return 0;
+    }
+  }
+
+  private getTokenPrice(poolInfo: any): number {
+    try {
+      // Input validation
+      if (!poolInfo?.baseReserve || !poolInfo?.quoteReserve) {
+        logger.debug('Missing pool reserves');
+        return 0;
+      }
+
+      const baseReserve = new BN(poolInfo.baseReserve);
+      const quoteReserve = new BN(poolInfo.quoteReserve);
+      
+      // Early validation
+      if (baseReserve.isZero() || quoteReserve.isZero()) {
+        logger.debug('Zero reserves detected');
+        return 0;
+      }
+
+      // Safe decimal handling
+      const baseDecimal = Number(poolInfo.baseDecimals) || 9;
+      const quoteDecimal = Number(poolInfo.quoteDecimals) || 6;
+      
+      if (isNaN(baseDecimal) || isNaN(quoteDecimal)) {
+        logger.warn('Invalid decimal values');
+        return 0;
+      }
+
+      // Convert to decimal numbers with validation
+      const baseAmount = Number(baseReserve) / Math.pow(10, baseDecimal);
+      if (isNaN(baseAmount) || baseAmount <= 0) {
+        logger.debug('Invalid base amount calculation');
+        return 0;
+      }
+
+      const quoteAmount = Number(quoteReserve) / Math.pow(10, quoteDecimal);
+      if (isNaN(quoteAmount) || quoteAmount <= 0) {
+        logger.debug('Invalid quote amount calculation');
+        return 0;
+      }
+
+      const price = quoteAmount / baseAmount;
+      
+      // Validate final price
+      if (!isFinite(price) || price < this.MIN_VALID_PRICE) {
+        logger.debug('Invalid price calculation result');
+        return 0;
+      }
+
+      return price;
+
+    } catch (error) {
+      logger.error('Error calculating token price:', error);
+      return 0;
+    }
   }
 }
