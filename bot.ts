@@ -95,7 +95,7 @@ export class Bot {
     lastCheck: QuickRugCheck;
   }>();
   private readonly MIN_VALID_PRICE = 0.000000001; // $0.000000001
-  private readonly MONITOR_INTERVAL = 3000; // 3 seconds
+  private readonly MONITOR_INTERVAL = 500; // 0.5 seconds
 
   constructor(
     private readonly connection: Connection,
@@ -183,15 +183,15 @@ export class Bot {
             // Launch trailing stop-loss monitor (existing method)
             this.trailingStopLossMonitor(purchasedTokenAmount, poolKeys, 3);
             // Launch partial profit-taking monitor with your configured thresholds.
-            this.partialProfitTakingMonitor(
-              purchasedTokenAmount,
-              poolKeys,
-              this.config.partialProfitThreshold,
-              this.config.partialProfitSellPercent
-            );
+            //this.partialProfitTakingMonitor(
+            //  purchasedTokenAmount,
+            //  poolKeys,
+            //  this.config.partialProfitThreshold,
+            //  this.config.partialProfitSellPercent
+            //);
 
             // Start quick monitoring
-            this.quickRugCheck(poolKeys, purchasedTokenAmount);
+            //this.quickRugCheck(poolKeys, purchasedTokenAmount);
 
             break;
           }
