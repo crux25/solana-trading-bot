@@ -181,7 +181,7 @@ export class Bot {
             // Use the actual purchased token amount from the swap result if available.
             const purchasedTokenAmount = new TokenAmount(new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals), this.config.quoteAmount.raw, true);
             // Launch trailing stop-loss monitor (existing method)
-            this.trailingStopLossMonitor(purchasedTokenAmount, poolKeys, 3);
+            //this.trailingStopLossMonitor(purchasedTokenAmount, poolKeys, 3);
             // Launch partial profit-taking monitor with your configured thresholds.
             //this.partialProfitTakingMonitor(
             //  purchasedTokenAmount,
