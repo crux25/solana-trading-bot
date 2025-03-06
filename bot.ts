@@ -757,16 +757,23 @@ export class Bot {
         return { safe: false, reason: 'No LP holders found' };
       }
 
-      // Calculate concentration with validation
-      const topHolderAmount = largestLPHolders.value[0].amount;
-      if (!topHolderAmount) {
-        return { safe: false, reason: 'Invalid LP holder amount' };
-      }
+      // Calculate total concentration of top 10 holders
+      const totalTopHoldersAmount = largestLPHolders.value
+        .slice(0, 10) // Take top 10 holders
+        .reduce((sum, holder) => sum + BigInt(holder.amount), BigInt(0));
 
-      const concentration = (Number(topHolderAmount) / Number(lpTokenSupply)) * 100;
-      console.log(`Concentration: ${concentration} top holder amount: ${topHolderAmount} lp token supply: ${lpTokenSupply}`);
-      if (isNaN(concentration) || concentration > 80) {
-        return { safe: false, reason: 'High or invalid LP token concentration' };
+      const concentration = (Number(totalTopHoldersAmount) / Number(lpTokenSupply)) * 100;
+      
+      logger.debug(
+        `Top 10 holders concentration: ${concentration.toFixed(2)}% ` +
+        `(${totalTopHoldersAmount} / ${lpTokenSupply})`
+      );
+
+      if (isNaN(concentration) || concentration > 20) {
+        return { 
+          safe: false, 
+          reason: `High LP concentration: top 10 holders control ${concentration.toFixed(2)}%`
+        };
       }
 
       // Check for recent liquidity changes
