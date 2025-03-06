@@ -760,6 +760,8 @@ export class Bot {
       // Get token account address for the pool
       const tokenAccountAddress = poolKeys.baseVault.toString();
 
+      console.log(`tokenAccountAddress: ${tokenAccountAddress}; largestLPHolders: ${JSON.stringify(largestLPHolders)}`);
+
       // Calculate total concentration of top 10 holders, excluding the token account
       const totalTopHoldersAmount = largestLPHolders.value
         .filter(holder => holder.address.toString() !== tokenAccountAddress) // Exclude token account
