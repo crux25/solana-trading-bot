@@ -764,6 +764,7 @@ export class Bot {
       }
 
       const concentration = (Number(topHolderAmount) / Number(lpTokenSupply)) * 100;
+      console.log(`Concentration: ${concentration} top holder amount: ${topHolderAmount} lp token supply: ${lpTokenSupply}`);
       if (isNaN(concentration) || concentration > 80) {
         return { safe: false, reason: 'High or invalid LP token concentration' };
       }
